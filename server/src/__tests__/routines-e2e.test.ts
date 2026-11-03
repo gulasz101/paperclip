@@ -284,7 +284,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
           for (const pending of routineResourceRequests(app, id)) {
             const response = await pending;
             expect(response.status, JSON.stringify(response.body)).toBe(404);
-            expect(response.body).toEqual({ error: response.req.path.includes("/routine-triggers/")
+            expect(response.body).toEqual({ error: pending.url.includes("/routine-triggers/")
               ? "Routine trigger not found" : "Routine not found" });
           }
         }
@@ -313,7 +313,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
         for (const pending of routineResourceRequests(app, id!, tid!)) {
           const response = await pending;
           expect(response.status, JSON.stringify(response.body)).toBe(404);
-          expect(response.body).toEqual({ error: response.req.path.includes("/routine-triggers/")
+          expect(response.body).toEqual({ error: pending.url.includes("/routine-triggers/")
             ? "Routine trigger not found" : "Routine not found" });
         }
       }
@@ -459,7 +459,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const event = (taskId: string, runId: string) => ({ action: "triggered", data: { event: { tags: [
       ["event_kind", "run_failure"], ["task_id", taskId], ["run_id", runId],
     ] } } });
-    const deliver = (payload: unknown, secret = secretMaterial.webhookSecret) => request(publicApp).post(path)
+    const deliver = (payload: object, secret = secretMaterial.webhookSecret) => request(publicApp).post(path)
       .set("Authorization", `Bearer ${secret}`).send(payload);
     expect((await deliver(event(source!.id, failedRun!.id), "invalid")).status).toBe(401);
     expect((await deliver({ action: "triggered", data: { event: {} } })).body).toMatchObject({ status: "ignored", routineStarted: false });

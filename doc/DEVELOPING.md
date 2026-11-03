@@ -1157,24 +1157,11 @@ The server typecheck builds only the Runner's TypeScript output. Use
 `pnpm --filter @paperclipai/paperclip-runner build` when a local check needs the
 Runner binary.
 
-`src/__tests__` has a backlog of type errors, so the test-tree layers do not fail on
-any error. They compare the error count of each file with
-`server/scripts/typecheck-test-tree-baseline.json`:
-
-- A count above the baseline fails. Fix the new errors. Do not raise the baseline
-  unless you have a reason that you can state in the pull request.
-- A count below the baseline fails, so a fixed error cannot come back. Lower the
-  baseline with the command below. It never raises a count or adds a file.
-
-```sh
-pnpm --filter @paperclipai/server typecheck --update-test-baseline
-```
-
-Errors in other packages that a test imports do not count, because their own
-projects check them. `src/__tests__/tsconfig.json` holds the options, so an editor
-and the typecheck report the same errors. See
-`doc/plans/2026-11-02-server-test-tree-typecheck.md` for the plan to remove the
-backlog.
+`src/__tests__/tsconfig.json` holds the options for the test-tree layers, so an
+editor and the typecheck report the same errors. Server tests reach Daytona plugin
+source, but the root install does not install that plugin's dependencies. So this
+config maps `@daytonaio/sdk` to `server/scripts/typecheck-stubs/daytona-sdk.d.ts`.
+The plugin's own project checks that source against the real package.
 
 If the memory available to the task is limited, use this command:
 
