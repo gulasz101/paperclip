@@ -41,6 +41,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { waitForExecutionRelease } from "../services/execution-release-wait.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -15877,6 +15878,23 @@ export function issueRoutes(
           !isClosedIssueStatus(issue.status) &&
           deferWakeForGoal !== true
         ) {
+          // A hand-off stops the current run and then wakes the successor right away.
+          // `cancelRun` returns once the run row is fenced; the environment lease that
+          // blocks this issue is released by the runtime finalizer up to ~1 s later. A
+          // successor wake that lands inside that window is written as a terminal
+          // execution-wait receipt rather than deferred (a plain assignment wake carries
+          // no comment or interaction id), so the hand-off never runs and only an
+          // unrelated timer ever rescues it. Give the release a bounded moment to land
+          // before the wake asks for admission.
+          if (interruptedRunId) {
+            const released = await waitForExecutionRelease(db, issue.companyId, issue.id, { runId: interruptedRunId });
+            if (!released) {
+              logger.warn(
+                { issueId: issue.id, interruptedRunId },
+                "hand-off wake enqueued while the stopped run still holds the issue",
+              );
+            }
+          }
           addWakeup(issue.assigneeAgentId, {
             source: "assignment",
             triggerDetail: "system",
