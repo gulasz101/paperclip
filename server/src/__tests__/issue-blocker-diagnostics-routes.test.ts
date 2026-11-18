@@ -4,6 +4,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -193,6 +194,7 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueRelations);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -246,6 +248,75 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
       isDependencyReady: true,
       flags: ["done_but_blocking"],
     });
+  });
+
+  it("shows no cancelled blocker after the blocker is cancelled through the route", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const dependent = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Waits on gate",
+      status: "blocked",
+    });
+    const gate = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Superseded gate",
+      status: "todo",
+    });
+    await blockIssue(db, company.id, gate.id, dependent.id);
+    const app = createApp(db, boardActor(company));
+
+    const cancelRes = await request(app)
+      .patch(`/api/issues/${gate.id}`)
+      .send({ status: "cancelled" });
+    expect(cancelRes.status, JSON.stringify(cancelRes.body)).toBe(200);
+
+    const res = await request(app).get(`/api/issues/${dependent.id}/diagnostics/blockers`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.blockers).toEqual([]);
+    expect(res.body.readiness).toMatchObject({
+      isDependencyReady: true,
+      unresolvedBlockerCount: 0,
+    });
+    const entries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.blockers_updated"));
+    expect(entries).toEqual([
+      expect.objectContaining({
+        entityId: dependent.id,
+        details: expect.objectContaining({
+          source: "blocker_cancelled",
+          removedBlockedByIssueIds: [gate.id],
+        }),
+      }),
+    ]);
+  });
+
+  it("still diagnoses a relation that points at an already-cancelled blocker", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const dependent = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Waits on old gate",
+      status: "blocked",
+    });
+    const gate = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Cancelled before the retire rule",
+      status: "cancelled",
+    });
+    await blockIssue(db, company.id, gate.id, dependent.id);
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${dependent.id}/diagnostics/blockers`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.diagnosis).toEqual(expect.stringContaining("cancelled"));
+    expect(res.body.readiness).toMatchObject({ isDependencyReady: false, unresolvedBlockerCount: 1 });
   });
 
   it("returns null diagnosis for an unblocked issue with no blocker relations", async () => {

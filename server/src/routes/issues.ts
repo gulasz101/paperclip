@@ -14797,6 +14797,15 @@ export function issueRoutes(
         updateFields.status === "done";
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
+      // Cancelling retires the `blocks` relations this issue owns (inside
+      // `svc.update`). Snapshot the dependents first so the ones that are now
+      // ready get the same wake a `done` blocker would give them.
+      const cancelRetiredDependentIssueIds =
+        existing.status !== "cancelled" &&
+        updateFields.status === "cancelled" &&
+        typeof svc.listBlocksDependentIssueIds === "function"
+          ? await svc.listBlocksDependentIssueIds(id)
+          : [];
       const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
         if (tx) {
           if (shouldCollectCompletionPublication) {
@@ -16034,6 +16043,34 @@ export function issueRoutes(
               blockedTransitionAt: dependent.blockedTransitionAt,
               source: "issue.blockers_resolved",
               mutation: "blocker_done",
+            });
+          }
+        }
+
+        const becameCancelled =
+          existing.status !== "cancelled" && issue.status === "cancelled";
+        if (
+          becameCancelled &&
+          cancelRetiredDependentIssueIds.length > 0 &&
+          typeof svc.listWakeableDependencyReadyIssues === "function"
+        ) {
+          const dependents = await svc.listWakeableDependencyReadyIssues(
+            issue.companyId,
+            cancelRetiredDependentIssueIds,
+          );
+          for (const dependent of dependents) {
+            await addDependencyResolvedWakeup({
+              agentId: dependent.assigneeAgentId,
+              dependentIssueId: dependent.id,
+              resolvedBlockerIssueId: issue.id,
+              // Keep the retired blocker in the ready-state key so it matches
+              // the shape of a done-blocker wake and is never an empty set.
+              blockerIssueIds: [
+                ...new Set([...dependent.blockerIssueIds, issue.id]),
+              ],
+              blockedTransitionAt: dependent.blockedTransitionAt,
+              source: "issue.blockers_resolved",
+              mutation: "blocker_cancelled",
             });
           }
         }
