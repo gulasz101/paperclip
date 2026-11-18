@@ -29,6 +29,8 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  listBlocksDependentIssueIds: vi.fn(),
+  listWakeableDependencyReadyIssues: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
 }));
@@ -186,6 +188,8 @@ describe("issue dependency wakeups in issue routes", () => {
       isDependencyReady: true,
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.listBlocksDependentIssueIds.mockResolvedValue([]);
+    mockIssueService.listWakeableDependencyReadyIssues.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
 
@@ -686,5 +690,93 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(res.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes a dependent whose only blocker was cancelled, like a done blocker would", async () => {
+    const gateIssueId = "33333333-3333-4333-8333-333333333333";
+    const onlyGateDependentId = "44444444-4444-4444-8444-444444444444";
+    const twoBlockerDependentId = "55555555-5555-4555-8555-555555555555";
+    const blockedAt = new Date("2026-11-01T10:00:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: gateIssueId,
+      identifier: "PAP-GATE",
+      title: "Gate",
+      status: "todo",
+      // Unassigned, so the cancel path has no active run to stop.
+      assigneeAgentId: null,
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: gateIssueId,
+      identifier: "PAP-GATE",
+      title: "Gate",
+      status: "cancelled",
+      assigneeAgentId: null,
+    }));
+    mockIssueService.listBlocksDependentIssueIds.mockResolvedValue([
+      onlyGateDependentId,
+      twoBlockerDependentId,
+    ]);
+    // The service only returns the dependent that is ready after the retire;
+    // the one with another open blocker is filtered out there.
+    mockIssueService.listWakeableDependencyReadyIssues.mockResolvedValue([
+      {
+        id: onlyGateDependentId,
+        assigneeAgentId: "agent-2",
+        blockerIssueIds: [],
+        blockedTransitionAt: blockedAt,
+      },
+    ]);
+
+    const res = await request(await createApp()).patch(`/api/issues/${gateIssueId}`).send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.listBlocksDependentIssueIds).toHaveBeenCalledWith(gateIssueId);
+    expect(mockIssueService.listWakeableDependencyReadyIssues).toHaveBeenCalledWith("company-1", [
+      onlyGateDependentId,
+      twoBlockerDependentId,
+    ]);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+            dependentIssueId: onlyGateDependentId,
+            blockerIssueIds: [gateIssueId],
+            blockedTransitionAt: blockedAt,
+          }),
+          payload: expect.objectContaining({
+            issueId: onlyGateDependentId,
+            resolvedBlockerIssueId: gateIssueId,
+            blockerIssueIds: [gateIssueId],
+            mutation: "blocker_cancelled",
+          }),
+        }),
+      );
+    });
+    expect(mockWakeup).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.listWakeableBlockedDependents).not.toHaveBeenCalled();
+  });
+
+  it("does not wake anything when a cancelled blocker leaves its dependents blocked", async () => {
+    const gateIssueId = "33333333-3333-4333-8333-333333333333";
+    mockIssueService.getById.mockResolvedValue(issueRecord({ id: gateIssueId, status: "todo", assigneeAgentId: null }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ id: gateIssueId, status: "cancelled", assigneeAgentId: null }));
+    mockIssueService.listBlocksDependentIssueIds.mockResolvedValue(["55555555-5555-4555-8555-555555555555"]);
+    mockIssueService.listWakeableDependencyReadyIssues.mockResolvedValue([]);
+
+    const res = await request(await createApp()).patch(`/api/issues/${gateIssueId}`).send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not look up retired dependents when the issue was already cancelled", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({ status: "cancelled" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ status: "cancelled" }));
+
+    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "cancelled" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.listBlocksDependentIssueIds).not.toHaveBeenCalled();
+    expect(mockIssueService.listWakeableDependencyReadyIssues).not.toHaveBeenCalled();
   });
 });

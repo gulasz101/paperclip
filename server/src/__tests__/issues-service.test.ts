@@ -4790,6 +4790,131 @@ const dependencyTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ISSU
     });
   });
 
+  it("retires the blocks relations a cancelled issue owns and records it on each dependent", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, assigneeAgentId);
+
+    const gateId = randomUUID();
+    const otherBlockerId = randomUUID();
+    const onlyGateDependentId = randomUUID();
+    const twoBlockerDependentId = randomUUID();
+    const unrelatedBlockerId = randomUUID();
+    const unrelatedDependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: gateId, companyId, identifier: "PAP-10", title: "Factory gate", status: "todo", priority: "medium" },
+      { id: otherBlockerId, companyId, title: "Other blocker", status: "todo", priority: "medium" },
+      { id: unrelatedBlockerId, companyId, title: "Unrelated blocker", status: "todo", priority: "medium" },
+      { id: onlyGateDependentId, companyId, identifier: "PAP-11", title: "Only gate", status: "blocked", priority: "medium", assigneeAgentId },
+      { id: twoBlockerDependentId, companyId, title: "Two blockers", status: "blocked", priority: "medium", assigneeAgentId },
+      { id: unrelatedDependentId, companyId, title: "Unrelated", status: "blocked", priority: "medium", assigneeAgentId },
+    ]);
+    await svc.update(onlyGateDependentId, { blockedByIssueIds: [gateId] });
+    await svc.update(twoBlockerDependentId, { blockedByIssueIds: [gateId, otherBlockerId] });
+    await svc.update(unrelatedDependentId, { blockedByIssueIds: [unrelatedBlockerId] });
+
+    await svc.update(gateId, { status: "cancelled", actorUserId: "local-board" });
+
+    const gateEdges = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.issueId, gateId));
+    expect(gateEdges).toEqual([]);
+    await expect(svc.getRelationSummaries(twoBlockerDependentId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: otherBlockerId })],
+    });
+    await expect(svc.getRelationSummaries(unrelatedDependentId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: unrelatedBlockerId })],
+    });
+
+    await expect(svc.getDependencyReadiness(onlyGateDependentId)).resolves.toMatchObject({
+      blockerIssueIds: [],
+      isDependencyReady: true,
+    });
+    await expect(svc.getDependencyReadiness(twoBlockerDependentId)).resolves.toMatchObject({
+      blockerIssueIds: [otherBlockerId],
+      unresolvedBlockerIssueIds: [otherBlockerId],
+      isDependencyReady: false,
+    });
+
+    const wakeable = await svc.listWakeableDependencyReadyIssues(companyId, [
+      onlyGateDependentId,
+      twoBlockerDependentId,
+    ]);
+    expect(wakeable).toEqual([
+      expect.objectContaining({ id: onlyGateDependentId, assigneeAgentId, blockerIssueIds: [] }),
+    ]);
+
+    const entries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.blockers_updated"));
+    expect(entries.map((entry) => entry.entityId).sort()).toEqual(
+      [onlyGateDependentId, twoBlockerDependentId].sort(),
+    );
+    const onlyGateEntry = entries.find((entry) => entry.entityId === onlyGateDependentId);
+    expect(onlyGateEntry).toMatchObject({
+      actorType: "user",
+      actorId: "local-board",
+      details: expect.objectContaining({
+        source: "blocker_cancelled",
+        cancelledBlockerIssueId: gateId,
+        identifier: "PAP-11",
+        blockedByIssueIds: [],
+        removedBlockedByIssueIds: [gateId],
+        removedBlockedByIssues: [{ id: gateId, identifier: "PAP-10", title: "Factory gate" }],
+      }),
+    });
+    const twoBlockerEntry = entries.find((entry) => entry.entityId === twoBlockerDependentId);
+    expect(twoBlockerEntry?.details).toMatchObject({ blockedByIssueIds: [otherBlockerId] });
+  });
+
+  it("does not restore retired blocks relations when a cancelled issue is reopened", async () => {
+    const companyId = randomUUID();
+    await seedIssueCompany(db, companyId);
+    const gateId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: gateId, companyId, title: "Gate", status: "todo", priority: "medium" },
+      { id: dependentId, companyId, title: "Dependent", status: "todo", priority: "medium" },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [gateId] });
+    await svc.update(gateId, { status: "cancelled" });
+    await svc.update(gateId, { status: "todo" });
+
+    await expect(svc.getRelationSummaries(dependentId)).resolves.toMatchObject({ blockedBy: [] });
+    const entries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.blockers_updated"));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ actorType: "system", entityId: dependentId });
+  });
+
+  it("keeps a relation to an already-cancelled blocker unresolved", async () => {
+    const companyId = randomUUID();
+    await seedIssueCompany(db, companyId);
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Cancelled earlier", status: "cancelled", priority: "medium" },
+      { id: dependentId, companyId, title: "Dependent", status: "todo", priority: "medium" },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: dependentId,
+      type: "blocks",
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      blockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+      isDependencyReady: false,
+    });
+  });
+
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {
     const companyId = randomUUID();
     await seedIssueCompany(db, companyId);

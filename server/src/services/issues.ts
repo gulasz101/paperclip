@@ -2770,8 +2770,16 @@ async function listIssueDependencyReadinessMap(
       readinessMap.get(row.issueId) ??
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
+    // Only done blockers resolve dependents. Cancelling an issue retires the
+    // `blocks` relations it owns in the same transaction as the status change
+    // (see `retireBlocksRelationsOfCancelledIssue`), with an activity entry on
+    // each dependent, so a cancelled blocker is normally no longer an edge here.
+    // If a relation to a cancelled blocker still exists (rows written before
+    // that rule, or a relation added to an already-cancelled issue), it stays
+    // unresolved on purpose: resolving it here would silently release work
+    // the cancelled gate was meant to hold, with no record. Un-cancelling
+    // (cancelled -> todo) does not restore retired relations; re-add them
+    // explicitly if the gate is live again.
     if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
@@ -2797,6 +2805,103 @@ async function listIssueDependencyReadinessMap(
   }
 
   return readinessMap;
+}
+
+/**
+ * Retire the `blocks` relations owned by an issue that just moved to
+ * `cancelled`. A cancelled issue will never reach `done`, so its outgoing
+ * edges would otherwise pin every dependent forever. The relations are deleted
+ * in the caller's transaction and each affected dependent gets an
+ * `issue.blockers_updated` activity entry naming the cancelled blocker, so the
+ * removal is visible. Waking dependents that are now ready is left to the
+ * caller (the issue route reuses the blocker-done wake path; the dependency
+ * backstop covers other callers). Un-cancelling does not restore the edges.
+ */
+async function retireBlocksRelationsOfCancelledIssue(
+  tx: any,
+  cancelledIssue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    title: string;
+  },
+  actor: { agentId: string | null; userId: string | null; runId: string | null },
+): Promise<ActivityPublication[]> {
+  const retired: Array<{ relatedIssueId: string }> = await tx
+    .delete(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, cancelledIssue.companyId),
+        eq(issueRelations.issueId, cancelledIssue.id),
+        eq(issueRelations.type, "blocks"),
+      ),
+    )
+    .returning({ relatedIssueId: issueRelations.relatedIssueId });
+  const dependentIssueIds = [...new Set(retired.map((row) => row.relatedIssueId))].sort();
+  if (dependentIssueIds.length === 0) return [];
+
+  const dependentRows: Array<{ id: string; identifier: string | null }> = await tx
+    .select({ id: issues.id, identifier: issues.identifier })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, cancelledIssue.companyId),
+        inArray(issues.id, dependentIssueIds),
+      ),
+    );
+  const remainingBlockerRows: Array<{ dependentIssueId: string; blockerIssueId: string }> = await tx
+    .select({
+      dependentIssueId: issueRelations.relatedIssueId,
+      blockerIssueId: issueRelations.issueId,
+    })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, cancelledIssue.companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, dependentIssueIds),
+      ),
+    );
+  const identifierById = new Map(dependentRows.map((row) => [row.id, row.identifier]));
+  const remainingByDependent = new Map<string, string[]>();
+  for (const row of remainingBlockerRows) {
+    const list = remainingByDependent.get(row.dependentIssueId) ?? [];
+    list.push(row.blockerIssueId);
+    remainingByDependent.set(row.dependentIssueId, list);
+  }
+
+  const actorType = actor.userId ? "user" : actor.agentId ? "agent" : "system";
+  const actorId = actor.userId ?? actor.agentId ?? "issue_cancel_retires_blockers";
+  const cancelledBlockerSummary = {
+    id: cancelledIssue.id,
+    identifier: cancelledIssue.identifier,
+    title: cancelledIssue.title,
+  };
+  const publications: ActivityPublication[] = [];
+  for (const dependentIssueId of dependentIssueIds) {
+    const { publication } = await persistActivity(tx as unknown as Db, {
+      companyId: cancelledIssue.companyId,
+      actorType,
+      actorId,
+      agentId: actor.agentId,
+      runId: actor.agentId ? actor.runId : null,
+      action: "issue.blockers_updated",
+      entityType: "issue",
+      entityId: dependentIssueId,
+      details: {
+        identifier: identifierById.get(dependentIssueId) ?? null,
+        source: "blocker_cancelled",
+        cancelledBlockerIssueId: cancelledIssue.id,
+        blockedByIssueIds: [...new Set(remainingByDependent.get(dependentIssueId) ?? [])].sort(),
+        addedBlockedByIssueIds: [],
+        removedBlockedByIssueIds: [cancelledIssue.id],
+        addedBlockedByIssues: [],
+        removedBlockedByIssues: [cancelledBlockerSummary],
+      },
+    });
+    publications.push(publication);
+  }
+  return publications;
 }
 
 async function listUnresolvedBlockerDetails(
@@ -9476,6 +9581,71 @@ export function issueService(db: Db) {
       return listIssueReviewAttentionMap(dbOrTx, companyId, issueRows);
     },
 
+    /** Dependents that a `blocks` relation owned by this issue currently holds. */
+    listBlocksDependentIssueIds: async (blockerIssueId: string) => {
+      const rows = await db
+        .select({ relatedIssueId: issueRelations.relatedIssueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.issueId, blockerIssueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+      return [...new Set(rows.map((row) => row.relatedIssueId))];
+    },
+
+    /**
+     * Wakeable, dependency-ready issues among `issueIds`. Used after a
+     * cancelled blocker retired its `blocks` relations: a dependent left with
+     * no blockers at all is ready too (unlike `listWakeableBlockedDependents`,
+     * which only sees dependents that still have the blocker edge).
+     */
+    listWakeableDependencyReadyIssues: async (companyId: string, issueIds: string[]) => {
+      const uniqueIssueIds = [...new Set(issueIds)];
+      if (uniqueIssueIds.length === 0) return [];
+      const candidates = await db
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+          blockedTransitionAt: issues.blockedTransitionAt,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, uniqueIssueIds),
+            isNull(issues.conversationAgentId),
+          ),
+        );
+      const wakeableCandidates = candidates.filter(
+        (candidate) =>
+          candidate.assigneeAgentId &&
+          !["backlog", "done", "cancelled"].includes(candidate.status),
+      );
+      if (wakeableCandidates.length === 0) return [];
+      const readinessMap = await listIssueDependencyReadinessMap(
+        db,
+        companyId,
+        wakeableCandidates.map((candidate) => candidate.id),
+      );
+      return wakeableCandidates
+        .map((candidate) => ({
+          candidate,
+          readiness:
+            readinessMap.get(candidate.id) ??
+            createIssueDependencyReadiness(candidate.id),
+        }))
+        .filter(({ readiness }) => readiness.isDependencyReady)
+        .map(({ candidate, readiness }) => ({
+          id: candidate.id,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
+        }));
+    },
+
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -11970,6 +12140,17 @@ export function issueService(db: Db) {
                 ),
               );
           }
+        }
+        if (
+          receiptExisting.status !== "cancelled" &&
+          updated.status === "cancelled"
+        ) {
+          const retiredPublications = await retireBlocksRelationsOfCancelledIssue(
+            tx,
+            updated,
+            { agentId: actorAgentId ?? null, userId: actorUserId ?? null, runId: actorRunId ?? null },
+          );
+          activityPublications.push(...retiredPublications);
         }
         if (
           actorUserId &&
