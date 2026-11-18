@@ -35,6 +35,8 @@ const mockIssueService = vi.hoisted(() => ({
 const mockPauseGate = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 const mockExecutionBlocker = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 vi.mock("../services/execution-blocker.js", () => ({ getExecutionBlocker: mockExecutionBlocker }));
+const mockReleaseWait = vi.hoisted(() => vi.fn(async (): Promise<boolean> => true));
+vi.mock("../services/execution-release-wait.js", () => ({ waitForExecutionRelease: mockReleaseWait }));
 const mockAccessDecide = vi.hoisted(() => vi.fn(async (input: { action?: string; resource?: { issueId?: string } }) => ({
   allowed: true,
   action: input.action,
@@ -287,6 +289,7 @@ describe("issue update comment wakeups", () => {
     mockAccessDecide.mockImplementation(async (input) => ({ allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "Allowed by test grant." }));
     mockPauseGate.mockResolvedValue(null);
     mockExecutionBlocker.mockResolvedValue(null);
+    mockReleaseWait.mockResolvedValue(true);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -614,6 +617,74 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("holds the hand-off wake until the stopped run releases the issue", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-1",
+      status: "in_progress",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-1",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-handoff",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "hand this over",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-1",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    });
+    // The stopped run's lease is still held when the route gets here.
+    let releaseStoppedRun: (released: boolean) => void = () => {};
+    mockReleaseWait.mockImplementation(() => new Promise<boolean>((resolve) => { releaseStoppedRun = resolve; }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        comment: "hand this over",
+        interrupt: true,
+      });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockReleaseWait).toHaveBeenCalledWith(
+      expect.anything(),
+      existing.companyId,
+      existing.id,
+      { runId: "run-1" },
+    ));
+    // Nothing wakes the successor while the cancelled run still holds the issue: a wake
+    // delivered here is recorded as a terminal execution-wait receipt and never runs.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    releaseStoppedRun(true);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({ issueId: existing.id, interruptedRunId: "run-1" }),
+      }),
+    ));
   });
 
   it("interrupts the active run without waking an agent when the handoff assigns a user", async () => {
